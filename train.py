@@ -14,22 +14,23 @@ from torch.utils.tensorboard import SummaryWriter
 from datetime import datetime
 
 from steve import STEVE
-from data import GlobVideoDataset
+#from data import GlobVideoDataset
+from movi_data_set import MoviDataset
 from utils import cosine_anneal, linear_warmup
 
 
 parser = argparse.ArgumentParser()
 
-parser.add_argument('--seed', type=int, default=0)
+parser.add_argument('--seed', type=int, default=0) #
 parser.add_argument('--batch_size', type=int, default=24)
 parser.add_argument('--num_workers', type=int, default=4)
 parser.add_argument('--image_size', type=int, default=128)
 parser.add_argument('--img_channels', type=int, default=3)
 parser.add_argument('--ep_len', type=int, default=3)
 
-parser.add_argument('--checkpoint_path', default='checkpoint.pt.tar')
-parser.add_argument('--data_path', default='data/*')
-parser.add_argument('--log_path', default='logs/')
+parser.add_argument('--checkpoint_path', default='checkpoint.pt.tar') #
+parser.add_argument('--data_path', default='data/*') #
+parser.add_argument('--log_path', default='logs/') #
 
 parser.add_argument('--lr_dvae', type=float, default=3e-4)
 parser.add_argument('--lr_enc', type=float, default=1e-4)
@@ -37,13 +38,13 @@ parser.add_argument('--lr_dec', type=float, default=3e-4)
 parser.add_argument('--lr_warmup_steps', type=int, default=30000)
 parser.add_argument('--lr_half_life', type=int, default=250000)
 parser.add_argument('--clip', type=float, default=0.05)
-parser.add_argument('--epochs', type=int, default=500)
+parser.add_argument('--epochs', type=int, default=10)
 parser.add_argument('--steps', type=int, default=200000)
 
 parser.add_argument('--num_iterations', type=int, default=2)
-parser.add_argument('--num_slots', type=int, default=15)
+parser.add_argument('--num_slots', type=int, default=10 + 1) #
 parser.add_argument('--cnn_hidden_size', type=int, default=64)
-parser.add_argument('--slot_size', type=int, default=192)
+parser.add_argument('--slot_size', type=int, default=64) #
 parser.add_argument('--mlp_hidden_size', type=int, default=192)
 parser.add_argument('--num_predictor_blocks', type=int, default=1)
 parser.add_argument('--num_predictor_heads', type=int, default=4)
@@ -64,6 +65,9 @@ parser.add_argument('--use_dp', default=True, action='store_true')
 
 args = parser.parse_args()
 
+if "movi_d" in args.data_path or "movi_e" in args.data_path:
+    args.num_slots = 23 + 1
+
 torch.manual_seed(args.seed)
 
 arg_str_list = ['{}={}'.format(k, v) for k, v in vars(args).items()]
@@ -72,24 +76,26 @@ log_dir = os.path.join(args.log_path, datetime.today().isoformat())
 writer = SummaryWriter(log_dir)
 writer.add_text('hparams', arg_str)
 
-train_dataset = GlobVideoDataset(root=args.data_path, phase='train', img_size=args.image_size, ep_len=args.ep_len, img_glob='????????_image.png')
-val_dataset = GlobVideoDataset(root=args.data_path, phase='val', img_size=args.image_size, ep_len=args.ep_len, img_glob='????????_image.png')
+#train_dataset = GlobVideoDataset(root=args.data_path, phase='train', img_size=args.image_size, ep_len=args.ep_len, img_glob='????????_image.png')
+#val_dataset = GlobVideoDataset(root=args.data_path, phase='val', img_size=args.image_size, ep_len=args.ep_len, img_glob='????????_image.png')
+
+train_dataset = MoviDataset(data_dir=args.data_path, img_size=args.image_size, seq_len=args.ep_len, train=True)
+val_dataset = MoviDataset(data_dir=args.data_path, img_size=args.image_size, train=False)
 
 loader_kwargs = {
-    'batch_size': args.batch_size,
-    'shuffle': True,
     'num_workers': args.num_workers,
-    'pin_memory': True,
-    'drop_last': True,
+    'pin_memory': True
 }
 
-train_loader = DataLoader(train_dataset, sampler=None, **loader_kwargs)
-val_loader = DataLoader(val_dataset, sampler=None, **loader_kwargs)
+train_loader = DataLoader(train_dataset, batch_size=args.batch_size, sampler=None, shuffle=True, drop_last=True, **loader_kwargs)
+val_loader = DataLoader(val_dataset, batch_size=10, sampler=None, shuffle=False, drop_last=False, **loader_kwargs)
 
 train_epoch_size = len(train_loader)
 val_epoch_size = len(val_loader)
 
-log_interval = train_epoch_size // 5
+log_interval = train_epoch_size // 200
+visualize_interval = log_interval * 5
+eval_interval = log_interval * 5
 
 model = STEVE(args)
 
@@ -141,10 +147,78 @@ def visualize(video, recon_dvae, recon_tf, attns, N=8):
     return frames
 
 
+def compute_ari(seg,
+                gt_seg,
+                num_groups,
+                ignore_background=True):
+    """Converted from the JAX version:
+    https://github.com/google-research/slot-attention-video/blob/main/savi/lib/metrics.py#L111
+    """
+    # Following SAVI, it may be that num_groups <= max(segmentation). We prune
+    # out extra objects here. For example, movi_e has an instance id of 64 in an
+    # outlier video.
+    # https://github.com/google-research/slot-attention-video/blob/main/savi/lib/preprocessing.py#L414
+    gt_seg = torch.where(gt_seg >= num_groups, torch.zeros_like(gt_seg), gt_seg)
+    seg = torch.where(seg >= num_groups, torch.zeros_like(seg), seg)
+
+    seg = torch.nn.functional.one_hot(seg, num_groups).to(torch.float32)
+    gt_seg = torch.nn.functional.one_hot(gt_seg, num_groups).to(torch.float32)
+
+    if ignore_background:
+        # remove background (id=0).
+        gt_seg = gt_seg[..., 1:]
+
+    N = torch.einsum('bthwc,bthwk->bck', gt_seg, seg)  # [B,c,k]
+    A = N.sum(-1)  # row-sum  [B,c]
+    B = N.sum(-2)  # col-sum  [B,k]
+    num_points = A.sum(1)  # [B]
+
+    rindex = (N * (N - 1)).sum((1, 2))  # [B]
+    aindex = (A * (A - 1)).sum(1)  # [B]
+    bindex = (B * (B - 1)).sum(1)  # [B]
+
+    expected_rindex = aindex * bindex / torch.clamp(
+        num_points * (num_points - 1), min=1)
+    max_rindex = (aindex + bindex) / 2
+    denominator = max_rindex - expected_rindex
+    ari = (rindex - expected_rindex) / denominator
+
+    # There are two cases for which the denominator can be zero:
+    # 1. If both label_pred and label_true assign all pixels to a single cluster.
+    #    (max_rindex == expected_rindex == rindex == num_points * (num_points-1))
+    # 2. If both label_pred and label_true assign max 1 point to each cluster.
+    #    (max_rindex == expected_rindex == rindex == 0)
+    # In both cases, we want the ARI score to be 1.0:
+    return torch.where(denominator > 0, ari, torch.ones_like(ari))
+
+
+def evaluation(model, tau, eval_loader, writer, global_step):
+    model.eval()
+    with torch.no_grad():
+        aris, fg_aris = [], []
+        total = 0
+        for sample, gt_seg  in eval_loader:
+            total += sample.shape[0]
+            video = sample.cuda()
+            gt_seg = gt_seg.cuda().long()
+            seg = model(video, tau, args.hard)[-1]
+            gt_seg = gt_seg.squeeze(2)
+            fg_ari = compute_ari(seg, gt_seg, num_groups=args.num_slots + 1)
+            ari = compute_ari(seg, gt_seg, num_groups=args.num_slots + 1, ignore_background=False)
+            fg_aris.append(fg_ari)
+            aris.append(ari)
+        mean_fg_ari = sum(fg_aris) / len(fg_aris)
+        mean_ari = sum(aris) / len(aris)
+        writer.add_scalar('eval/fg_ari', mean_fg_ari.mean(), global_step=global_step)
+        writer.add_scalar('eval/ari', mean_ari.mean(), global_step=global_step)
+        print("Total evaluated: ", total)
+    model.train()
+
+
 for epoch in range(start_epoch, args.epochs):
     model.train()
-    
-    for batch, video in enumerate(train_loader):
+
+    for batch, (video, seg) in enumerate(train_loader):
         global_step = epoch * train_epoch_size + batch
 
         tau = cosine_anneal(
@@ -177,24 +251,24 @@ for epoch in range(start_epoch, args.epochs):
         video = video.cuda()
 
         optimizer.zero_grad()
-        
-        (recon, cross_entropy, mse, attns) = model(video, tau, args.hard)
+
+        (recon, cross_entropy, mse, attns, seg) = model(video, tau, args.hard)
 
         if args.use_dp:
             mse = mse.mean()
             cross_entropy = cross_entropy.mean()
 
         loss = mse + cross_entropy
-        
+
         loss.backward()
         clip_grad_norm_(model.parameters(), args.clip, 'inf')
         optimizer.step()
-        
+
         with torch.no_grad():
             if batch % log_interval == 0:
                 print('Train Epoch: {:3} [{:5}/{:5}] \t Loss: {:F} \t MSE: {:F}'.format(
                       epoch+1, batch, train_epoch_size, loss.item(), mse.item()))
-                
+
                 writer.add_scalar('TRAIN/loss', loss.item(), global_step)
                 writer.add_scalar('TRAIN/cross_entropy', cross_entropy.item(), global_step)
                 writer.add_scalar('TRAIN/mse', mse.item(), global_step)
@@ -204,66 +278,21 @@ for epoch in range(start_epoch, args.epochs):
                 writer.add_scalar('TRAIN/lr_enc', optimizer.param_groups[1]['lr'], global_step)
                 writer.add_scalar('TRAIN/lr_dec', optimizer.param_groups[2]['lr'], global_step)
 
-    with torch.no_grad():
-        gen_video = (model.module if args.use_dp else model).reconstruct_autoregressive(video[:8])
-        frames = visualize(video, recon, gen_video, attns, N=8)
-        writer.add_video('TRAIN_recons/epoch={:03}'.format(epoch+1), frames)
-    
-    with torch.no_grad():
-        model.eval()
-
-        val_cross_entropy = 0.
-        val_mse = 0.
-
-        for batch, video in enumerate(val_loader):
-            video = video.cuda()
-
-            (recon, cross_entropy, mse, attns) = model(video, tau, args.hard)
-
-            if args.use_dp:
-                mse = mse.mean()
-                cross_entropy = cross_entropy.mean()
-
-            val_cross_entropy += cross_entropy.item()
-            val_mse += mse.item()
-
-        val_cross_entropy /= (val_epoch_size)
-        val_mse /= (val_epoch_size)
-
-        val_loss = val_mse + val_cross_entropy
-
-        writer.add_scalar('VAL/loss', val_loss, epoch+1)
-        writer.add_scalar('VAL/cross_entropy', val_cross_entropy, epoch + 1)
-        writer.add_scalar('VAL/mse', val_mse, epoch+1)
-
-        print('====> Epoch: {:3} \t Loss = {:F}'.format(epoch+1, val_loss))
-
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
-            best_epoch = epoch + 1
-
-            torch.save(model.module.state_dict() if args.use_dp else model.state_dict(), os.path.join(log_dir, 'best_model.pt'))
-
-            if global_step < args.steps:
-                torch.save(model.module.state_dict() if args.use_dp else model.state_dict(), os.path.join(log_dir, f'best_model_until_{args.steps}_steps.pt'))
-
-            if 50 <= epoch:
+            if batch % visualize_interval == 0:
                 gen_video = (model.module if args.use_dp else model).reconstruct_autoregressive(video[:8])
                 frames = visualize(video, recon, gen_video, attns, N=8)
-                writer.add_video('VAL_recons/epoch={:03}'.format(epoch + 1), frames)
+                writer.add_video('TRAIN_recons/epoch={:03}'.format(epoch+1), frames, global_step, fps=1)
 
-        writer.add_scalar('VAL/best_loss', best_val_loss, epoch+1)
+            if batch % eval_interval == 0:
+                evaluation(model, tau, val_loader, writer, global_step)
 
-        checkpoint = {
-            'epoch': epoch + 1,
-            'best_val_loss': best_val_loss,
-            'best_epoch': best_epoch,
-            'model': model.module.state_dict() if args.use_dp else model.state_dict(),
-            'optimizer': optimizer.state_dict(),
-        }
+    ##########
+    checkpoint = {
+        'epoch': epoch + 1,
+        'model': model.module.state_dict() if args.use_dp else model.state_dict(),
+        'optimizer': optimizer.state_dict(),
+    }
 
-        torch.save(checkpoint, os.path.join(log_dir, 'checkpoint.pt.tar'))
-
-        print('====> Best Loss = {:F} @ Epoch {}'.format(best_val_loss, best_epoch))
+    torch.save(checkpoint, args.checkpoint_path)
 
 writer.close()

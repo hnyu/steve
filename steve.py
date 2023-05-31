@@ -5,7 +5,7 @@ from transformer import TransformerEncoder, TransformerDecoder
 
 
 class SlotAttentionVideo(nn.Module):
-    
+
     def __init__(self, num_iterations, num_slots,
                  input_size, slot_size, mlp_hidden_size,
                  num_predictor_blocks=1,
@@ -13,7 +13,7 @@ class SlotAttentionVideo(nn.Module):
                  dropout=0.1,
                  epsilon=1e-8):
         super().__init__()
-        
+
         self.num_iterations = num_iterations
         self.num_slots = num_slots
         self.input_size = input_size
@@ -31,12 +31,12 @@ class SlotAttentionVideo(nn.Module):
         self.norm_inputs = nn.LayerNorm(input_size)
         self.norm_slots = nn.LayerNorm(slot_size)
         self.norm_mlp = nn.LayerNorm(slot_size)
-        
+
         # linear maps for the attention module.
         self.project_q = linear(slot_size, slot_size, bias=False)
         self.project_k = linear(input_size, slot_size, bias=False)
         self.project_v = linear(input_size, slot_size, bias=False)
-        
+
         # slot update functions.
         self.gru = gru_cell(slot_size, slot_size)
         self.mlp = nn.Sequential(
@@ -57,7 +57,7 @@ class SlotAttentionVideo(nn.Module):
         k = self.project_k(inputs)  # Shape: [batch_size, T, num_inputs, slot_size].
         v = self.project_v(inputs)  # Shape: [batch_size, T, num_inputs, slot_size].
         k = (self.slot_size ** (-0.5)) * k
-        
+
         # loop over frames
         attns_collect = []
         slots_collect = []
@@ -156,7 +156,7 @@ class OneHotDictionary(nn.Module):
 class STEVEEncoder(nn.Module):
     def __init__(self, args):
         super().__init__()
-        
+
         self.cnn = nn.Sequential(
             Conv2dBlock(args.img_channels, args.cnn_hidden_size, 5, 1 if args.image_size == 64 else 2, 2),
             Conv2dBlock(args.cnn_hidden_size, args.cnn_hidden_size, 5, 1, 2),
@@ -199,10 +199,10 @@ class STEVEDecoder(nn.Module):
 
 
 class STEVE(nn.Module):
-    
+
     def __init__(self, args):
         super().__init__()
-        
+
         self.num_iterations = args.num_iterations
         self.num_slots = args.num_slots
         self.cnn_hidden_size = args.cnn_hidden_size
@@ -221,6 +221,20 @@ class STEVE(nn.Module):
 
         # decoder networks
         self.steve_decoder = STEVEDecoder(args)
+
+    def get_segmentation(self, mask, threshold=0.6):
+        """Binarize ``G`` masks and merge them into a segmentation map.
+        """
+        # mask: [B,T,G,1,H,W], log space
+        # [B,T,G,H,W]
+        mask = mask.squeeze(3)
+        mask = (mask > threshold).to(torch.int32)
+        idx = torch.arange(mask.shape[2]) + 1  # {1,2,...,G}
+        idx = idx.reshape((1, 1) + idx.shape + (1, 1))  # [1,1,G,1,1]
+        idx_mask = idx.to(mask) * mask
+        # seg: [B,T,H,W], zeros representing background
+        seg = idx_mask.sum(dim=2)
+        return seg
 
     def forward(self, video, tau, hard):
         B, T, C, H, W = video.size()
@@ -257,6 +271,8 @@ class STEVE(nn.Module):
             .reshape(B, T, self.num_slots, 1, H_enc, W_enc)\
             .repeat_interleave(H // H_enc, dim=-2)\
             .repeat_interleave(W // W_enc, dim=-1)          # B, T, num_slots, 1, H, W
+        # compute segments
+        seg = self.get_segmentation(attns)  # [B,T,H,W]
         attns = video.unsqueeze(2) * attns + (1. - attns)                               # B, T, num_slots, C, H, W
 
         # decode
@@ -268,7 +284,8 @@ class STEVE(nn.Module):
         return (dvae_recon.clamp(0., 1.),
                 cross_entropy,
                 dvae_mse,
-                attns)
+                attns,
+                seg)
 
     def encode(self, video):
         B, T, C, H, W = video.size()
